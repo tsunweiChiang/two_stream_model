@@ -7,13 +7,14 @@ import subprocess
 import os
 from pathlib import Path
 from torchvision import transforms
-
+from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from model.model import TwoStreamModel
 
 CHECKPOINT_PATH = Path(__file__).parent.parent / 'checkpoints' / 'best_model.pth'
 CLASS_NAMES = ['start', 'stop']
 WINDOW_SIZE = 11
+SLIDE_STEP = 5
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 _SPATIAL_TRANSFORM = transforms.Compose([
@@ -30,25 +31,46 @@ def load_model(checkpoint_path=CHECKPOINT_PATH, num_classes=2):
     model.eval()
     return model
 
-def _compute_optical_flow(frames):
-    h, w = frames[0].shape[:2]
-    L = len(frames) - 1
+def _compute_optical_flow(window):
+    # 1. 【加速關鍵】先 Resize 到 224x224，大幅減少計算量
+    small_window = [cv2.resize(f, (224, 224), interpolation=cv2.INTER_AREA) for f in window]
+    
+    h, w = 224, 224
+    L = len(small_window) - 1
     stacked = np.zeros((h, w, 2 * L), dtype=np.uint8)
+    
+    # 建立網格，用於後續的 remap
     grid_u, grid_v = np.meshgrid(np.arange(w), np.arange(h))
     p_u, p_v = grid_u.astype(np.float32), grid_v.astype(np.float32)
 
+    # 建議使用 DIS 光流，這在 CPU 上比 Farneback 快非常多
+    dis_flow = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_FAST)
+
     for k in range(L):
-        prev_gray = cv2.cvtColor(frames[k], cv2.COLOR_BGR2GRAY)
-        next_gray = cv2.cvtColor(frames[k + 1], cv2.COLOR_BGR2GRAY)
-        flow = cv2.calcOpticalFlowFarneback(prev_gray, next_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
-        dx=cv2.remap(flow[...,0],p_u,p_v,cv2.INTER_LINEAR)
-        dy=cv2.remap(flow[...,1],p_u,p_v,cv2.INTER_LINEAR)
-        dx -=np.mean(dx)
-        dy -=np.mean(dy)
-        p_u = np.clip(p_u + dx, 0, w - 1)
-        p_v = np.clip(p_v + dy, 0, h - 1)
-        stacked[..., 2 * k] = np.uint8(np.clip((dx + 20) * (255 / 40), 0, 255))
-        stacked[..., 2 * k + 1] = np.uint8(np.clip((dy + 20) * (255 / 40), 0, 255))
+        prev_gray = cv2.cvtColor(small_window[k], cv2.COLOR_BGR2GRAY)
+        next_gray = cv2.cvtColor(small_window[k + 1], cv2.COLOR_BGR2GRAY)
+        
+        # 計算光流 (這裡會產生 dx 和 dy)
+        flow = dis_flow.calc(prev_gray, next_gray, None)
+        dx = flow[..., 0]
+        dy = flow[..., 1]
+        
+        # 進行修正與運算 (現在 dx, dy 已經定義好了)
+        # 如果你原本有使用 remap 邏輯：
+        dx_remapped = cv2.remap(dx, p_u, p_v, cv2.INTER_LINEAR)
+        dy_remapped = cv2.remap(dy, p_u, p_v, cv2.INTER_LINEAR)
+        
+        dx_remapped -= np.mean(dx_remapped)
+        dy_remapped -= np.mean(dy_remapped)
+        
+        # 更新位置 (如果你的算法需要累積位移)
+        p_u = np.clip(p_u + dx_remapped, 0, w - 1)
+        p_v = np.clip(p_v + dy_remapped, 0, h - 1)
+
+        # 映射到 0-255 並存入 stacked
+        stacked[..., 2 * k] = np.uint8(np.clip((dx_remapped + 20) * (255 / 40), 0, 255))
+        stacked[..., 2 * k + 1] = np.uint8(np.clip((dy_remapped + 20) * (255 / 40), 0, 255))
+        
     return stacked
 
 def _preprocess_spatial(frame):
@@ -56,12 +78,15 @@ def _preprocess_spatial(frame):
     return _SPATIAL_TRANSFORM(rgb).unsqueeze(0)
 
 def _preprocess_temporal(flow):
-    nc = flow.shape[2]
-    resized = np.stack([cv2.resize(flow[..., c], (224, 224), interpolation=cv2.INTER_AREA) for c in range(nc)], axis=0)
-    return torch.from_numpy(resized).float().unsqueeze(0) / 255.0
+    # flow 形狀已經是 (224, 224, 2 * L)
+    # 我們只需要把通道 (Channel) 維度搬到最前面：(C, H, W)
+    # 使用 transpose(2, 0, 1) 會比在裡面跑 cv2.resize 快非常多
+    processed = flow.transpose(2, 0, 1) 
+    return torch.from_numpy(processed).float().unsqueeze(0) / 255.0
 
 def run_inference(video_path, checkpoint_path=CHECKPOINT_PATH, on_window=None, infer_batch=32):
     model = load_model(checkpoint_path)
+    print(DEVICE)
     cap = cv2.VideoCapture(str(video_path))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     frames = []
@@ -73,32 +98,38 @@ def run_inference(video_path, checkpoint_path=CHECKPOINT_PATH, on_window=None, i
 
     if len(frames) < WINDOW_SIZE:
         raise ValueError(f"影片幀數不足，至少需要 {WINDOW_SIZE} 幀")
-
-    num_windows = len(frames) // WINDOW_SIZE
+    window_start=list(range(0, len(frames) - WINDOW_SIZE + 1, SLIDE_STEP))
+    num_windows = len(window_start)
     window_predictions = []
-
+    print(f"window_num:{num_windows}")
     with torch.no_grad():
+        # 批次處理window
         for batch_start in range(0, num_windows, infer_batch):
-            batch_end = min(batch_start + infer_batch, num_windows)
-            sp_list, tp_list = [], []
-            for i in range(batch_start, batch_end):
-                window = frames[i * WINDOW_SIZE:(i + 1) * WINDOW_SIZE]
-                sp_list.append(_preprocess_spatial(window[WINDOW_SIZE // 2]))
-                tp_list.append(_preprocess_temporal(_compute_optical_flow(window)))
+            batch_indices = window_start[batch_start : batch_start + infer_batch]
+            # 預處理每個 batch window 資料
+            windows_in_batch = [frames[i : i + WINDOW_SIZE] for i in batch_indices]
+
+            # 2. 處理空間流 (很快，維持原樣)
+            sp_list = [_preprocess_spatial(win[WINDOW_SIZE // 2]) for win in windows_in_batch]
+
+            # 3. 處理時間流 (最慢，使用並行加速)
+            # 建立執行緒池，利用所有 CPU 核心
+            with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+                # 並行執行光流計算
+                flow_results = list(executor.map(_compute_optical_flow, windows_in_batch))
+        
+            # 將計算好的光流張量化
+            tp_list = [_preprocess_temporal(flow) for flow in flow_results]
 
             sp, tp = torch.cat(sp_list).to(DEVICE), torch.cat(tp_list).to(DEVICE)
             probs = torch.softmax(model(sp, tp), dim=1)
 
-            for j in range(batch_end - batch_start):
+            # 回傳每個 window 的預測結果
+            for j in range(len(batch_indices)):
                 idx = probs[j].argmax().item()
                 cls, conf = CLASS_NAMES[idx], float(probs[j, idx])
                 window_predictions.append((cls, conf))
                 if on_window: on_window(batch_start + j + 1, num_windows, cls, conf)
-
-    votes = {}
-    for cls, _ in window_predictions: votes[cls] = votes.get(cls, 0) + 1
-    final_pred = max(votes, key=votes.get)
-    final_conf = float(np.mean([c for cls, c in window_predictions if cls == final_pred]))
 
     # --- 修正影片寫入部分 ---
     h, w = frames[0].shape[:2]
@@ -134,7 +165,7 @@ def run_inference(video_path, checkpoint_path=CHECKPOINT_PATH, on_window=None, i
             final_path
         ], check=True)
         os.remove(raw_tmp_path)
-        return final_path, window_predictions, final_pred, final_conf
+        return final_path, window_predictions
     except:
         # 如果 ffmpeg 轉檔失敗，就回傳原始路徑
-        return raw_tmp_path, window_predictions, final_pred, final_conf
+        return raw_tmp_path, window_predictions

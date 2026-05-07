@@ -23,7 +23,7 @@ if uploaded_file is not None:
     tfile.close()
 
     st.subheader("原始影片預覽")
-    st.video(tfile.name)
+    st.video(tfile.name,autoplay=True,loop=True)
 
     if st.button("開始推論", type="primary"):
         progress_bar = st.progress(0, text="初始化模型...")
@@ -37,7 +37,7 @@ if uploaded_file is not None:
 
         try:
             # 執行推論
-            out_path, preds, final_pred, final_conf = run_inference(
+            out_path, preds= run_inference(
                 tfile.name, on_window=on_window
             )
             
