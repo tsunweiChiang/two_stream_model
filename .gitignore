@@ -1,0 +1,8 @@
+# 排除大型資料與權重
+dataset/
+checkpoints/
+paper/
+
+# 排除 Python 暫存
+__pycache__/
+.ipynb_checkpoints/
