@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 # 確保能匯入 inference
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 from inference import run_inference
 
 st.set_page_config(page_title="Two-Stream Model Inference", layout="centered")
@@ -46,7 +46,7 @@ if uploaded_file is not None:
 
             st.success("推論完成！")
             st.subheader("推論結果影片")
-            st.video(out_path)
+            st.video(out_path,autoplay=True,loop=True)
 
             with open(out_path, 'rb') as f:
                 st.download_button(
@@ -66,6 +66,7 @@ if uploaded_file is not None:
             # 清理臨時檔案
             if os.path.exists(tfile.name):
                 os.unlink(tfile.name)
+                
 
 else:
     st.info("請上傳影片檔案以開始作業。")

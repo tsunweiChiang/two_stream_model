@@ -10,6 +10,7 @@ from torchvision import transforms
 from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from model.model import TwoStreamModel
+import gc
 
 CHECKPOINT_PATH = Path(__file__).parent.parent / 'checkpoints' / 'best_model.pth'
 CLASS_NAMES = ['start', 'stop']
@@ -43,7 +44,7 @@ def _compute_optical_flow(window):
     grid_u, grid_v = np.meshgrid(np.arange(w), np.arange(h))
     p_u, p_v = grid_u.astype(np.float32), grid_v.astype(np.float32)
 
-    # 建議使用 DIS 光流，這在 CPU 上比 Farneback 快非常多
+    # 建議使用 DIS 光流，這在 CPU 上比 Farneback 快非常多(使用 fast)
     dis_flow = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_FAST)
 
     for k in range(L):
@@ -79,7 +80,7 @@ def _preprocess_spatial(frame):
 
 def _preprocess_temporal(flow):
     # flow 形狀已經是 (224, 224, 2 * L)
-    # 我們只需要把通道 (Channel) 維度搬到最前面：(C, H, W)
+    # 把通道 (Channel) 維度搬到最前面：(C, H, W)
     # 使用 transpose(2, 0, 1) 會比在裡面跑 cv2.resize 快非常多
     processed = flow.transpose(2, 0, 1) 
     return torch.from_numpy(processed).float().unsqueeze(0) / 255.0
@@ -130,6 +131,10 @@ def run_inference(video_path, checkpoint_path=CHECKPOINT_PATH, on_window=None, i
                 cls, conf = CLASS_NAMES[idx], float(probs[j, idx])
                 window_predictions.append((cls, conf))
                 if on_window: on_window(batch_start + j + 1, num_windows, cls, conf)
+            
+            del sp, tp, probs, sp_list, tp_list, flow_results
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     # --- 修正影片寫入部分 ---
     h, w = frames[0].shape[:2]
@@ -165,7 +170,12 @@ def run_inference(video_path, checkpoint_path=CHECKPOINT_PATH, on_window=None, i
             final_path
         ], check=True)
         os.remove(raw_tmp_path)
-        return final_path, window_predictions
     except:
-        # 如果 ffmpeg 轉檔失敗，就回傳原始路徑
-        return raw_tmp_path, window_predictions
+        final_path = raw_tmp_path
+    
+    del frames, model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return final_path, window_predictions
